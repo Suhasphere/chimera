@@ -163,6 +163,35 @@ set(CHIMERA_TEST_TIER quick)
 add_test(NAME chimera/server/nfs/nfs_persist COMMAND test_nfs_persist)
 set(CHIMERA_TEST_TIER extended)
 
+# Issue #1377: NFSv4.0 clientids and setclientid_confirm verifiers must not be
+# regenerated across a server restart (RFC 7530 §9.1.1, §16.33.5), so a
+# pre-restart client's RENEW / SETCLIENTID_CONFIRM draws NFS4ERR_STALE_CLIENTID
+# instead of resolving to a different client.  Simulates the restart in-process
+# like test_nfs_persist.
+add_executable(test_nfs4_clientid_reboot
+    test_nfs4_clientid_reboot.c
+    ${CMAKE_CURRENT_SOURCE_DIR}/../nfs4_session.c
+    ${CMAKE_CURRENT_SOURCE_DIR}/../nfs4_state.c
+    ${CMAKE_CURRENT_SOURCE_DIR}/../nfs4_layout_table.c
+    ${CMAKE_CURRENT_SOURCE_DIR}/../nfs4_lease.c
+    ${CMAKE_CURRENT_SOURCE_DIR}/nsm_renew_stub.c
+    ${CMAKE_CURRENT_SOURCE_DIR}/../nfs4_recovery.c
+    ${CMAKE_CURRENT_SOURCE_DIR}/../nfs4_drc.c
+    ${CMAKE_CURRENT_SOURCE_DIR}/../nfs3_drc.c
+    ${CMAKE_CURRENT_SOURCE_DIR}/../nfs4_v40_drc.c
+    ${CMAKE_CURRENT_SOURCE_DIR}/../nfs_drc_reply.c
+    ${CMAKE_CURRENT_SOURCE_DIR}/../nfs4_callback.c
+    ${CMAKE_CURRENT_SOURCE_DIR}/../nfs_peer_probe.c
+    ${CMAKE_CURRENT_SOURCE_DIR}/../nfs4_cb.c)
+target_include_directories(test_nfs4_clientid_reboot PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/..
+    ${CMAKE_SOURCE_DIR}/src
+    ${NFS_COMMON_INCLUDE_DIR})
+target_link_libraries(test_nfs4_clientid_reboot chimera_vfs chimera_common evpl evpl_rpc2 ${CHIMERA_UUID_LIB} ${CHIMERA_RCU_LIBS})
+add_dependencies(test_nfs4_clientid_reboot chimera_nfs_common)
+add_test(NAME chimera/server/nfs/nfs4_clientid_reboot COMMAND test_nfs4_clientid_reboot)
+set_tests_properties(chimera/server/nfs/nfs4_clientid_reboot PROPERTIES TIMEOUT 60)
+
 # Fleet-wide client recovery records over a shared (memkv) KV store: per-node
 # reload, legacy migration, owner-checked deletes, dead-peer import.
 add_executable(test_nfs_failover
