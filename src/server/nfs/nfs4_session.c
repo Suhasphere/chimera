@@ -5,6 +5,8 @@
 #include "common/thread.h"
 #include <stdio.h>
 #include <string.h>
+#include <time.h>
+#include "common/misc.h"
 #include "common/uuid.h"
 #include <xxhash.h>
 #include "prometheus-c.h"
@@ -79,23 +81,64 @@ replay_field_retry_uncached(struct nfs4_replay_metrics *rm)
     return rm->retry_uncached;
 } /* replay_field_retry_uncached */
 
+/* Stamp the per-boot parts of minted clientids and confirm verifiers.  The
+ * boot epoch is nanoseconds of wall clock (or strictly past the previous
+ * boot's, when the KV store is persistent), so fold all of it down rather
+ * than keep the slowly-moving high bits.  boot_gen 0 is reserved: it is what
+ * bits 47..32 of every clientid minted before boot_gen existed hold. */
+static void
+nfs4_client_table_stamp_boot(
+    struct nfs4_client_table *table,
+    uint64_t                  boot_id)
+{
+    uint16_t gen = (uint16_t) (boot_id ^ (boot_id >> 16) ^
+                               (boot_id >> 32) ^ (boot_id >> 48));
+
+    table->nfs4_ct_boot_gen     = gen ? gen : 1;
+    table->nfs4_ct_confirm_boot = (uint32_t) (boot_id ^ (boot_id >> 32));
+} /* nfs4_client_table_stamp_boot */
+
 void
 nfs4_client_table_init(
     struct nfs4_client_table *table,
     uint16_t                  node_id)
 {
+    struct timespec ts;
+
     table->nfs4_ct_clients_by_owner = NULL;
     table->nfs4_ct_clients_by_id    = NULL;
     table->nfs4_ct_sessions         = NULL;
-    table->nfs4_ct_next_client_id   = 1;
     table->nfs4_ct_node_id          = node_id;
-    table->nfs4_ct_next_confirm     = 1;
     table->nfs4_ct_forget           = NULL;
     table->nfs4_ct_forget_count     = 0;
     table->nfs4_ct_forget_capacity  = 0;
 
+    /* RFC 7530 §16.33.5: clientids and setclientid_confirm verifiers must be
+     * "extremely unlikely to ever be regenerated" -- across restarts too
+     * (§9.1.1), because NFS4ERR_STALE_CLIENTID on a pre-restart clientid is
+     * how a 4.0 client learns it must reclaim.  node_id is the same on every
+     * boot by design, so a per-boot generation (provisional here, from the
+     * clock; final in nfs4_client_table_set_boot) and random sequence starts
+     * keep this boot's values apart from every earlier boot's. */
+    clock_gettime(CLOCK_REALTIME, &ts);
+    nfs4_client_table_stamp_boot(table,
+                                 (uint64_t) ts.tv_sec * 1000000000ULL +
+                                 (uint64_t) ts.tv_nsec);
+    table->nfs4_ct_next_client_id = chimera_rand64() & NFS4_CLIENTID_SEQ_MASK;
+    table->nfs4_ct_next_confirm   = chimera_rand64() & NFS4_CLIENTID_SEQ_MASK;
+
     evpl_mutex_init(&table->nfs4_ct_lock, NULL);
 } /* nfs4_client_table_init */
+
+void
+nfs4_client_table_set_boot(
+    struct nfs4_client_table *table,
+    uint64_t                  boot_id)
+{
+    evpl_mutex_lock(&table->nfs4_ct_lock);
+    nfs4_client_table_stamp_boot(table, boot_id);
+    evpl_mutex_unlock(&table->nfs4_ct_lock);
+} /* nfs4_client_table_set_boot */
 
 void
 nfs4_client_table_free(struct nfs4_client_table *table)
@@ -176,7 +219,8 @@ nfs4_client_register(
     } else {
         client = calloc(1, sizeof(*client));
 
-        client->nfs4_client_id = nfs4_make_clientid(table->nfs4_ct_node_id,
+        client->nfs4_client_id = nfs4_mint_clientid(table->nfs4_ct_node_id,
+                                                    table->nfs4_ct_boot_gen,
                                                     table->nfs4_ct_next_client_id++);
 
         memcpy(client->nfs4_client_owner, owner, owner_len);
@@ -295,7 +339,8 @@ nfs4_client_new_locked(
 {
     struct nfs4_client *c = calloc(1, sizeof(*c));
 
-    c->nfs4_client_id = nfs4_make_clientid(table->nfs4_ct_node_id,
+    c->nfs4_client_id = nfs4_mint_clientid(table->nfs4_ct_node_id,
+                                           table->nfs4_ct_boot_gen,
                                            table->nfs4_ct_next_client_id++);
     c->nfs4_client_owner_len     = owner_len;
     c->nfs4_client_verifier      = verifier;
@@ -634,13 +679,16 @@ nfs4_client_remove_byid_locked(
 } /* nfs4_client_remove_byid_locked */
 
 /* Caller holds the table lock.  Stamp a fresh, unique setclientid_confirm
- * verifier onto a record and mark a confirm pending. */
+ * verifier onto a record and mark a confirm pending.  The high half is this
+ * boot's, so a confirm retransmitted from before a restart never matches a
+ * record of the new boot (RFC 7530 §16.33.5). */
 static void
 nfs4_scid_set_confirm(
     struct nfs4_client_table *table,
     struct nfs4_client       *c)
 {
-    uint64_t v = table->nfs4_ct_next_confirm++;
+    uint64_t v = ((uint64_t) table->nfs4_ct_confirm_boot << 32) |
+        (table->nfs4_ct_next_confirm++ & NFS4_CLIENTID_SEQ_MASK);
 
     memcpy(c->nfs4_client_scid_confirm, &v, NFS4_VERIFIER_SIZE);
     c->nfs4_client_scid_confirm_valid = 1;

@@ -2494,6 +2494,100 @@ test_node_scoped_identifiers(void)
     printf("ok: node_scoped_identifiers\n");
 } /* test_node_scoped_identifiers */
 
+/* Issue #1377: node_id is the same on every boot of a node, so the clientids
+ * and setclientid_confirm verifiers of one boot must still never be handed out
+ * by a later one (RFC 7530 §9.1.1, §16.33.5) -- the pre-restart clientid has
+ * to stay unknown, so the client it was minted for is told
+ * NFS4ERR_STALE_CLIENTID and reclaims, instead of resolving to whichever new
+ * client the number went to. */
+static void
+test_clientid_boot_scoped(void)
+{
+    struct nfs4_client_table       t1,t2;
+    struct nfs4_client_principal   princ;
+    struct nfs4_setclientid_result r1,r2;
+    struct nfs4_client            *c;
+    struct nfs_client             *destroy_unified = NULL;
+    static const uint8_t           owner_a[]       = "boot_scoped_a";
+    static const uint8_t           owner_b[]       = "boot_scoped_b";
+    uint64_t                       restored,seq_before;
+
+    memset(&princ,0,sizeof(princ));
+    princ.flavor = 1;
+
+    /* Boot 1: client A registers. */
+    nfs4_client_table_init(&t1,7);
+    nfs4_client_table_set_boot(&t1,1000000000ULL);
+    CHECK(t1.nfs4_ct_boot_gen != 0);
+    nfs4_client_setclientid(&t1,owner_a,(int) sizeof(owner_a) - 1,0x1111ULL,
+                            &princ,0,&r1);
+    CHECK(r1.status == NFS4_OK);
+    CHECK(nfs4_clientid_node(r1.clientid) == 7);
+    CHECK(nfs4_clientid_boot(r1.clientid) == t1.nfs4_ct_boot_gen);
+
+    /* Boot 2 of the same node: the first client to register is someone else. */
+    nfs4_client_table_init(&t2,7);
+    nfs4_client_table_set_boot(&t2,2000000000ULL);
+    CHECK(t2.nfs4_ct_boot_gen != t1.nfs4_ct_boot_gen);
+    nfs4_client_setclientid(&t2,owner_b,(int) sizeof(owner_b) - 1,0x2222ULL,
+                            &princ,0,&r2);
+    CHECK(r2.status == NFS4_OK);
+    CHECK(nfs4_clientid_node(r2.clientid) == 7);
+    CHECK(r2.clientid != r1.clientid);
+    CHECK(memcmp(r2.confirm,r1.confirm,NFS4_VERIFIER_SIZE) != 0);
+
+    /* A's clientid means nothing to the new boot, and a confirm of A's old
+     * pair retransmitted across the restart cannot succeed. */
+    HASH_FIND(nfs4_client_hh_by_id,t2.nfs4_ct_clients_by_id,
+              &r1.clientid,sizeof(r1.clientid),c);
+    CHECK(c == NULL);
+    CHECK(nfs4_client_setclientid_confirm(&t2,r1.clientid,r1.confirm,&princ,
+                                          &destroy_unified) ==
+          NFS4ERR_STALE_CLIENTID);
+    CHECK(destroy_unified == NULL);
+
+    /* boot_gen 0 is reserved for clientids minted before it existed. */
+    nfs4_client_table_set_boot(&t2,0);
+    CHECK(t2.nfs4_ct_boot_gen == 1);
+    nfs4_client_table_set_boot(&t2,2000000000ULL);
+
+    /* Restoring a persisted session whose clientid an earlier boot (or a
+     * pre-boot_gen build) minted leaves this boot's sequence alone: the
+     * two cannot collide. */
+    seq_before = t2.nfs4_ct_next_client_id;
+    restored   = nfs4_make_clientid(7,(seq_before & NFS4_CLIENTID_SEQ_MASK) + 5);
+    CHECK(nfs4_clientid_boot(restored) != t2.nfs4_ct_boot_gen);
+    {
+        struct nfs4_drc_session_record srec;
+        uint8_t                        sessionid[NFS4_SESSIONID_SIZE];
+        static const uint8_t           owner_r[] = "boot_scoped_restored";
+
+        memset(&srec,0,sizeof(srec));
+        memset(sessionid,0x6B,NFS4_SESSIONID_SIZE);
+        srec.clientid              = restored;
+        srec.verifier              = 0x3333ULL;
+        srec.princ_flavor          = 1;
+        srec.replay_max_slots      = 8;
+        srec.replay_maxresp_cached = 4096;
+        srec.owner_len             = sizeof(owner_r) - 1;
+        memcpy(srec.owner,owner_r,srec.owner_len);
+        nfs_client_put(nfs4_drc_reconstruct_session(&t2,sessionid,&srec,
+                                                    0x9999ULL,
+                                                    NFS4_MAX_REPLY_CACHE_SLOTS));
+    }
+    HASH_FIND(nfs4_client_hh_by_id,t2.nfs4_ct_clients_by_id,
+              &restored,sizeof(restored),c);
+    CHECK(c != NULL);
+    CHECK(t2.nfs4_ct_next_client_id == seq_before);
+
+    nfs4_client_table_destroy_unified(&t1,NULL,NULL);
+    nfs4_client_table_free(&t1);
+    nfs4_client_table_destroy_unified(&t2,NULL,NULL);
+    nfs4_client_table_free(&t2);
+
+    printf("ok: clientid_boot_scoped\n");
+} /* test_clientid_boot_scoped */
+
 /* Two complementary sharing properties:
  *
  *   - NODE-scoped records (recovery, epoch): with the same owner persisted by
@@ -2609,6 +2703,7 @@ main(void)
     test_nfs_drc_copy_results();
 
     test_node_scoped_identifiers();
+    test_clientid_boot_scoped();
     test_two_node_key_isolation();
 
     printf("PASS: all nfs persistence tests\n");

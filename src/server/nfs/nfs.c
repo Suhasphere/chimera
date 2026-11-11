@@ -639,6 +639,11 @@ nfs_server_start(void *arg)
      * must find the load finished, not race it. */
     nfs_recovery_cold_start(&shared->nfs4_recovery);
 
+    /* The boot epoch is final now: fold it into every clientid and
+     * setclientid_confirm verifier, still before any client can register. */
+    nfs4_client_table_set_boot(&shared->nfs4_shared_clients,
+                               shared->nfs4_recovery.current_boot_id);
+
     /* Likewise no handle may be minted or verified before the fleet FH keyring
      * is loaded (or the fleet's first key minted). */
     if (shared->fh_sign) {
