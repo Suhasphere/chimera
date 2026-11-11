@@ -662,15 +662,16 @@ nfs4_drc_ensure_client(
     HASH_ADD(nfs4_client_hh_by_id, table->nfs4_ct_clients_by_id,
              nfs4_client_id, sizeof(client->nfs4_client_id), client);
 
-    /* Keep the id allocator ahead of every restored clientid.  The low 48 bits
-     * are the per-instance counter (the high 16 are this node's node_id), and
-     * next_client_id holds just that counter -- so compare/advance on the low
-     * bits, not the whole 64-bit value. */
-    {
-        uint64_t counter = client_id & NFS4_CLIENTID_COUNTER_MASK;
+    /* A restored clientid keeps the node_id and boot_gen it was minted under
+     * (nfs4_mint_clientid), so it cannot collide with one this boot mints --
+     * unless it names this node and a boot whose generation folded to the
+     * same 16 bits as this one's.  Only then keep the sequence ahead of it. */
+    if (nfs4_clientid_node(client_id) == table->nfs4_ct_node_id &&
+        nfs4_clientid_boot(client_id) == table->nfs4_ct_boot_gen) {
+        uint64_t seq = client_id & NFS4_CLIENTID_SEQ_MASK;
 
-        if (table->nfs4_ct_next_client_id <= counter) {
-            table->nfs4_ct_next_client_id = counter + 1;
+        if ((table->nfs4_ct_next_client_id & NFS4_CLIENTID_SEQ_MASK) <= seq) {
+            table->nfs4_ct_next_client_id = seq + 1;
         }
     }
 

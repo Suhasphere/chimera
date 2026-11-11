@@ -346,12 +346,20 @@ struct nfs4_client_table {
     struct nfs4_client    *nfs4_ct_clients_by_owner;
     struct nfs4_client    *nfs4_ct_clients_by_id;
     struct nfs4_session   *nfs4_ct_sessions;
-    /* Low 48 bits of the next clientid; the high 16 are this instance's node_id
-     * (see nfs4_make_clientid) so peers sharing one store never collide. */
+    /* Sequence for the low 32 bits of the next clientid (nfs4_mint_clientid).
+     * Starts at a random value every boot. */
     uint64_t               nfs4_ct_next_client_id;
     uint16_t               nfs4_ct_node_id;
-    /* Monotonic source for SETCLIENTID setclientid_confirm verifiers; every
-     * value handed out is unique for the life of the table. */
+    /* This boot's generation: bits 47..32 of every clientid minted here, so a
+     * clientid minted by an earlier boot of this node is never handed out
+     * again (RFC 7530 §9.1.1, §16.33.5).  Never 0, so it also never matches a
+     * clientid minted before the field existed. */
+    uint16_t               nfs4_ct_boot_gen;
+    /* High 32 bits of every setclientid_confirm verifier, derived from the
+     * boot epoch like nfs4_ct_boot_gen. */
+    uint32_t               nfs4_ct_confirm_boot;
+    /* Low 32 bits of the next setclientid_confirm verifier; starts at a
+     * random value every boot. */
     uint64_t               nfs4_ct_next_confirm;
     /* Persistent sessions taken out of the table along with their client
      * (fence, supersede) whose KV records are still to be deleted, so a later
@@ -363,17 +371,45 @@ struct nfs4_client_table {
     evpl_mutex_t           nfs4_ct_lock;
 };
 
-/* A clientid carries the minting instance's node_id in its high 16 bits and a
- * per-instance counter in the low 48, so two instances over one backing store
- * never hand out the same value (and `clientid >> 48` is the owning node). */
+/* A clientid is
+ *
+ *   bits 63..48  node_id   the minting instance, so two instances over one
+ *                          backing store never hand out the same value (and
+ *                          `clientid >> 48` is the owning node);
+ *   bits 47..32  boot_gen  the minting boot, so this node's restarts never
+ *                          hand out a value an earlier boot did -- a stale
+ *                          clientid stays unknown and answers
+ *                          NFS4ERR_STALE_CLIENTID (RFC 7530 §9.1.1, §16.33.5);
+ *   bits 31..0   sequence  per boot, from a random start.
+ *
+ * nfs4_make_clientid() packs node_id over the low 48 bits (boot_gen and
+ * sequence together); nfs4_mint_clientid() builds them from their parts. */
 #define NFS4_CLIENTID_COUNTER_MASK 0xFFFFFFFFFFFFULL
+#define NFS4_CLIENTID_SEQ_MASK     0xFFFFFFFFULL
+#define NFS4_CLIENTID_BOOT_SHIFT   32
 #define nfs4_make_clientid(node_id, counter) \
         (((uint64_t) (node_id) << 48) | ((counter)&NFS4_CLIENTID_COUNTER_MASK))
+#define nfs4_mint_clientid(node_id, boot_gen, seq) \
+        nfs4_make_clientid(node_id,                                     \
+                           ((uint64_t) (boot_gen) << NFS4_CLIENTID_BOOT_SHIFT) | \
+                           ((uint64_t) (seq)&NFS4_CLIENTID_SEQ_MASK))
+#define nfs4_clientid_node(clientid) ((uint16_t) ((clientid) >> 48))
+#define nfs4_clientid_boot(clientid) \
+        ((uint16_t) ((clientid) >> NFS4_CLIENTID_BOOT_SHIFT))
 
 void
 nfs4_client_table_init(
     struct nfs4_client_table *table,
     uint16_t                  node_id);
+
+/* Fold this boot's epoch (nfs_recovery.current_boot_id) into every clientid
+ * and setclientid_confirm verifier minted from here on.  Called once the
+ * recovery load has settled the epoch and before any listener is bound;
+ * nfs4_client_table_init stamps a provisional one from the clock. */
+void
+nfs4_client_table_set_boot(
+    struct nfs4_client_table *table,
+    uint64_t                  boot_id);
 
 void
 nfs4_client_table_free(

@@ -386,6 +386,26 @@ if(CHIMERA_NETNS_TESTING AND EXISTS "/opt/pynfs/nfs4.0/nfs4lib.py" AND
         ENVIRONMENT "PYTHONUNBUFFERED=1")
 endif()
 
+# Stale-clientid-across-restart regression (issue #1377): an NFSv4.0 clientid
+# (and setclientid_confirm verifier) minted before a server restart must never
+# be handed to a client of the new boot, and presenting it afterwards must be
+# NFS4ERR_STALE_CLIENTID -- the signal that sends a client into reboot
+# recovery -- rather than resolving to whichever client now holds the number.
+# Crashes and restarts a real daemon between the two phases; needs pynfs's
+# NFSv4.0 client and a network namespace to own port 2049.  The wrapper exits
+# 77 (skip) if pynfs is missing at run time.
+if(CHIMERA_NETNS_TESTING AND EXISTS "/opt/pynfs/nfs4.0/nfs4lib.py")
+    add_test(NAME chimera/server/nfs/v40_stale_clientid
+        COMMAND bash ${CMAKE_SOURCE_DIR}/scripts/nfs4_v40_stale_clientid_test_wrapper.sh
+                ${CMAKE_BINARY_DIR}/src/daemon/chimera
+                /opt/pynfs
+                ${CMAKE_CURRENT_SOURCE_DIR}/nfs4_v40_stale_clientid.py)
+    set_tests_properties(chimera/server/nfs/v40_stale_clientid PROPERTIES
+        SKIP_RETURN_CODE 77
+        TIMEOUT 180
+        ENVIRONMENT "PYTHONUNBUFFERED=1")
+endif()
+
 # End-to-end NFSv4.1 presented-stateid validation: a superseded stateid seqid
 # must be NFS4ERR_OLD_STATEID (not silently honored -- a stale pipelined CLOSE
 # must not destroy live state), and a wrong-epoch stateid must be
