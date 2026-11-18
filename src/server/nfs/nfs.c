@@ -33,6 +33,10 @@
 #include "nfs_common.h"
 #include "nfs_internal.h"
 #include "nfs4_session.h"
+#include "clientid_allocator.h"
+#include "clientid_format.h"
+#include <jansson.h>
+#include <stdlib.h>
 #include "nfs4_lease.h"
 #include "nfs4_v40_drc.h"
 #include "nfs4_drc.h"
@@ -165,6 +169,99 @@ nfs_fh_key_init(
                           "survive restart", path, strerror(errno));
     }
 } /* nfs_fh_key_init */
+
+/* Strict decimal parse of a supervisor-provided environment value. */
+static int
+nfs_clientid_env_uint(
+    const char *name,
+    uint64_t   *out)
+{
+    const char *v = getenv(name);
+    char       *end;
+
+    if (!v || !*v || *v < '0' || *v > '9') {
+        return -1;
+    }
+    errno = 0;
+    *out  = strtoull(v, &end, 10);
+    return (errno || *end) ? -1 : 0;
+} /* nfs_clientid_env_uint */
+
+/*
+ * Resolve the NFSv4 client ID allocator configuration (clientid_allocator.h).
+ * The allocator never reads the environment; startup does, here:
+ *
+ *   1. server.nfs4_clientid_allocator, if configured, is used as given;
+ *   2. otherwise CHIMERA_NODE_ID / CHIMERA_INSTANCE / CHIMERA_GENERATION
+ *      select local Type 1 (supervisor grant): all three must be present and
+ *      decimal.  A unique Node ID and a fresh Generation on every start are
+ *      the supervisor's responsibility;
+ *   3. otherwise there is no client ID namespace.
+ *
+ * Returns NULL, with the reason logged, when there is no namespace or the
+ * configuration is invalid; the caller then does not offer NFSv4 at all
+ * (fail closed), rather than minting IDs nobody granted.
+ */
+static json_t *
+nfs_clientid_resolve_config(struct chimera_server_nfs_shared *shared)
+{
+    const char                      *text = chimera_server_config_get_nfs4_clientid_allocator(shared->config);
+    int                              have_env;
+    json_t                          *cfg = NULL;
+    json_error_t                     err;
+    struct clientid_allocator_config acfg;
+    int                              rc;
+
+    have_env = getenv("CHIMERA_NODE_ID") || getenv("CHIMERA_INSTANCE") ||
+        getenv("CHIMERA_GENERATION");
+
+    if (text) {
+        cfg = json_loads(text, 0, &err);
+        if (!cfg) {
+            chimera_nfs_error("nfs4_clientid_allocator is not valid JSON: %s", err.text);
+            return NULL;
+        }
+        if (have_env) {
+            chimera_nfs_info("CHIMERA_NODE_ID/INSTANCE/GENERATION are ignored: "
+                             "nfs4_clientid_allocator is configured");
+        }
+    } else if (have_env) {
+        uint64_t node, instance, generation;
+
+        if (nfs_clientid_env_uint("CHIMERA_NODE_ID", &node) ||
+            nfs_clientid_env_uint("CHIMERA_INSTANCE", &instance) ||
+            nfs_clientid_env_uint("CHIMERA_GENERATION", &generation)) {
+            chimera_nfs_error("CHIMERA_NODE_ID, CHIMERA_INSTANCE and "
+                              "CHIMERA_GENERATION must all be set to decimal "
+                              "integers to use the supervisor-grant client ID "
+                              "allocator (Type 1)");
+            return NULL;
+        }
+        cfg = json_pack("{s:i, s:s, s:i, s:{s:i, s:I, s:I, s:I}}",
+                        "schema", 1, "backend", "local", "type", CLIENTID_TYPE_SUPERVISOR,
+                        "kwargs", "version", 0, "node_id", (json_int_t) node,
+                        "instance", (json_int_t) instance,
+                        "generation", (json_int_t) generation);
+    } else {
+        chimera_nfs_error("No NFSv4 client ID namespace: set CHIMERA_NODE_ID, "
+                          "CHIMERA_INSTANCE and CHIMERA_GENERATION (supervisor grant) "
+                          "or configure server.nfs4_clientid_allocator");
+        return NULL;
+    }
+    if (!cfg) {
+        return NULL;
+    }
+
+    acfg.json = cfg;
+    rc        = clientid_allocator_supported(&acfg);
+    if (rc) {
+        chimera_nfs_error("NFSv4 client ID allocator configuration rejected (%s)",
+                          rc == ENOTSUP ? "not supported by this build" : "invalid");
+        json_decref(cfg);
+        return NULL;
+    }
+    return cfg;
+} /* nfs_clientid_resolve_config */
 
 static void *
 nfs_server_init(
@@ -425,7 +522,14 @@ nfs_server_init(
     shared->nsm_v1.recv_call_SM_SIMU_CRASH = chimera_nfs_sm_simu_crash;
     shared->nsm_v1.recv_call_SM_NOTIFY     = chimera_nfs_sm_notify;
 
-    nfs4_client_table_init(&shared->nfs4_shared_clients, shared->node_id);
+    nfs4_client_table_init(&shared->nfs4_shared_clients);
+
+    shared->clientid_config = nfs_clientid_resolve_config(shared);
+    shared->nfs4_offered    = shared->clientid_config != NULL;
+    if (!shared->nfs4_offered) {
+        chimera_nfs_error("NFSv4 is NOT offered: no usable client ID allocator "
+                          "(NFSv3 is unaffected)");
+    }
     nfs_state_table_init(&shared->nfs4_state_table, shared->node_id);
     nfs_layout_table_init(&shared->nfs4_layout_table);
     nfs3_drc_init(&shared->nfs3_drc, CHIMERA_KV_TYPE_NFS3_REPLY);
@@ -585,8 +689,20 @@ nfs_server_init(
     if (!nfs3_disabled) {
         programs[nprogs++] = &shared->nfs_v3.rpc2;
     }
-    programs[nprogs++] = &shared->nfs_v4.rpc2;
-    programs[nprogs++] = &shared->nfs_v4_cb.rpc2;
+    /* Without a usable client ID allocator NFSv4 cannot register clients, so
+     * it is not offered at all: clients see a version mismatch and fall back
+     * to NFSv3, rather than mounting and failing every registration. */
+    if (shared->nfs4_offered) {
+        programs[nprogs++] = &shared->nfs_v4.rpc2;
+        programs[nprogs++] = &shared->nfs_v4_cb.rpc2;
+    }
+
+    /* nfs3_disabled asks for NFSv4 only; with NFSv4 unavailable too there is
+    * nothing to serve, so refuse to start rather than listen for nothing. */
+    chimera_nfs_fatal_if(nprogs == 0,
+                         "NFSv3 is disabled (nfs3_disabled) and NFSv4 is not offered "
+                         "(the client ID allocator configuration was rejected): "
+                         "nothing to serve");
 
     shared->nfs_server = evpl_rpc2_server_init(programs, nprogs);
 
@@ -661,6 +777,15 @@ nfs_server_start(void *arg)
      * setclientid_confirm verifier, still before any client can register. */
     nfs4_client_table_set_boot(&shared->nfs4_shared_clients,
                                shared->nfs4_recovery.current_boot_id);
+
+    /* The client ID allocator, likewise before any listener. */
+    if (shared->nfs4_offered) {
+        struct clientid_allocator_config acfg;
+
+        acfg.json = shared->clientid_config;
+        rc        = clientid_allocator_create(&acfg, &shared->clientid_alloc);
+        chimera_nfs_abort_if(rc, "failed to create the NFSv4 client ID allocator: %d", rc);
+    }
 
     /* Likewise no handle may be minted or verified before the fleet FH keyring
      * is loaded (or the fleet's first key minted). */
@@ -931,6 +1056,12 @@ nfs_server_destroy(void *data)
     nfs4_v40_drc_destroy(&shared->v40_drc);
     nfs3_drc_destroy(&shared->nfs3_drc);
     nfs4_drc_hydra_destroy(shared);
+
+    /* Every NFS thread (and so every allocator home loop) is gone by now. */
+    clientid_allocator_destroy(shared->clientid_alloc);
+    if (shared->clientid_config) {
+        json_decref(shared->clientid_config);
+    }
 
     free(shared);
 } /* nfs_server_destroy */

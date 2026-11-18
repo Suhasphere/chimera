@@ -34,8 +34,18 @@
 #include "evpl/evpl.h"
 #include "nfs4_state.h"
 #include "nfs_kv_keys.h"
+#include <errno.h>
+#include "clientid_format.h"
 
-#define CHECK(cond) do { \
+/* Client IDs come from the allocator in the server; tests supply their own
+ * Type 1 / Version 0 values (node, generation, sequence; instance 0). */
+#define TEST_T1(node, gen, seq) \
+        ((1ULL << 60) | ((uint64_t) (node) << 48) | ((uint64_t) (gen) << 24) | \
+         (uint64_t) (seq))
+static uint32_t test_next_clientid_seq = 100000;
+#define TEST_CLIENTID() TEST_T1(1, 1, test_next_clientid_seq++)
+
+#define CHECK(cond)     do { \
             if (!(cond)) { \
                 fprintf(stderr, "%s:%d: CHECK failed: %s\n", \
                         __FILE__, __LINE__, #cond); \
@@ -364,8 +374,8 @@ test_cross_reboot_replay(void)
     uint64_t                       clientid;
 
     /* --- instance A: a live persistent session with one cached reply --- */
-    nfs4_client_table_init(&table_a,1);
-    clientid = nfs4_client_register(&table_a,owner,(int) sizeof(owner) - 1,
+    nfs4_client_table_init(&table_a);
+    clientid = nfs4_client_register(&table_a,TEST_CLIENTID(),owner,(int) sizeof(owner) - 1,
                                     0x1234ULL,40,NULL,NULL);
     session = nfs4_create_session(&table_a,clientid,0,8,4096,
                                   NULL,NULL,NULL,true);
@@ -396,7 +406,7 @@ test_cross_reboot_replay(void)
     nfs4_client_table_free(&table_a);
 
     /* --- instance B: cold-start reconstruction from the persisted bytes --- */
-    nfs4_client_table_init(&table_b,1);
+    nfs4_client_table_init(&table_b);
 
     CHECK(nfs4_drc_session_deserialize(sbuf,slen,&srec) == 0);
     nfs_client_put(nfs4_drc_reconstruct_session(&table_b,sessionid,&srec,
@@ -462,8 +472,8 @@ rebuild_session_after_reboot(struct nfs4_client_table*table_b)
     static const uint8_t           owner[] = "co_owner_resync";
     uint64_t                       clientid;
 
-    nfs4_client_table_init(&table_a,1);
-    clientid = nfs4_client_register(&table_a,owner,(int) sizeof(owner) - 1,
+    nfs4_client_table_init(&table_a);
+    clientid = nfs4_client_register(&table_a,TEST_CLIENTID(),owner,(int) sizeof(owner) - 1,
                                     0x1234ULL,40,NULL,NULL);
     session = nfs4_create_session(&table_a,clientid,0,8,4096,
                                   NULL,NULL,NULL,true);
@@ -488,7 +498,7 @@ rebuild_session_after_reboot(struct nfs4_client_table*table_b)
     nfs4_client_table_destroy_unified(&table_a,NULL,NULL);
     nfs4_client_table_free(&table_a);
 
-    nfs4_client_table_init(table_b,1);
+    nfs4_client_table_init(table_b);
     CHECK(nfs4_drc_session_deserialize(sbuf,slen,&srec) == 0);
     nfs_client_put(nfs4_drc_reconstruct_session(table_b,sessionid,&srec,
                                                 0x9999ULL,
@@ -837,7 +847,7 @@ test_untrusted_session_record_bounded(void)
     for (int i = 0; i < 2; i++) {
         memset(sessionid,0x5E + i,NFS4_SESSIONID_SIZE);
         memset(&srec,0,sizeof(srec));
-        srec.clientid              = nfs4_make_clientid(1,77);
+        srec.clientid              = TEST_T1(1,1,77);
         srec.verifier              = 0x7777ULL;
         srec.princ_flavor          = 1;
         srec.replay_max_slots      = persisted[i];
@@ -845,7 +855,7 @@ test_untrusted_session_record_bounded(void)
         srec.owner_len             = sizeof(owner) - 1;
         memcpy(srec.owner,owner,srec.owner_len);
 
-        nfs4_client_table_init(&table,1);
+        nfs4_client_table_init(&table);
         nfs_client_put(nfs4_drc_reconstruct_session(&table,sessionid,&srec,
                                                     0x9999ULL,CAP));
         session = nfs4_session_lookup(&table,sessionid);
@@ -968,8 +978,8 @@ test_cross_reboot_reclaim_complete(void)
     /* --- instance A: a live 4.1 session that never sent RECLAIM_COMPLETE,
      * which is the ordinary state of a persisted record: the session is
      * written at CREATE_SESSION, before any RECLAIM_COMPLETE could arrive. */
-    nfs4_client_table_init(&table_a,1);
-    clientid = nfs4_client_register(&table_a,owner,(int) sizeof(owner) - 1,
+    nfs4_client_table_init(&table_a);
+    clientid = nfs4_client_register(&table_a,TEST_CLIENTID(),owner,(int) sizeof(owner) - 1,
                                     0x4321ULL,41,NULL,NULL);
     session = nfs4_create_session(&table_a,clientid,0,8,4096,
                                   NULL,NULL,NULL,true);
@@ -997,7 +1007,7 @@ test_cross_reboot_reclaim_complete(void)
     nfs4_client_table_free(&table_a);
 
     /* --- instance B: the lazy hydrate a SEQUENCE on the old sessionid runs */
-    nfs4_client_table_init(&table_b,1);
+    nfs4_client_table_init(&table_b);
     CHECK(nfs4_drc_session_deserialize(sbuf,slen,&srec) == 0);
     nfs_client_put(nfs4_drc_reconstruct_session(&table_b,sessionid,&srec,
                                                 0x9999ULL,
@@ -1041,7 +1051,7 @@ test_failover_client_must_reclaim(void)
     struct nfs_client             *other;
     uint8_t                        sessionid2[NFS4_SESSIONID_SIZE];
 
-    clientid = nfs4_make_clientid(2,9);
+    clientid = TEST_T1(2,1,9);
     memset(sessionid,0x6B,NFS4_SESSIONID_SIZE);
 
     memset(&srec,0,sizeof(srec));
@@ -1062,7 +1072,7 @@ test_failover_client_must_reclaim(void)
 
     /* No evidence: the client owes a RECLAIM_COMPLETE before non-reclaim
      * OPENs, and its first one is not COMPLETE_ALREADY. */
-    nfs4_client_table_init(&table,1);
+    nfs4_client_table_init(&table);
     unified = nfs4_drc_reconstruct_session(&table,sessionid,&srec,0x9999ULL,
                                            NFS4_MAX_REPLY_CACHE_SLOTS);
     CHECK(nfs4_client_reclaim_complete(&table,clientid));
@@ -1095,7 +1105,7 @@ test_failover_client_must_reclaim(void)
     nfs_client_put(unified);
 
     /* Evidence: it may still reclaim, but its OPENs are not held back. */
-    clientid       = nfs4_make_clientid(2,10);
+    clientid       = TEST_T1(2,1,10);
     srec.clientid  = clientid;
     srec.owner[0] ^= 1;
     memset(sessionid2,0x6D,NFS4_SESSIONID_SIZE);
@@ -1132,8 +1142,8 @@ test_reclaim_complete_not_granted_to_new_clients(void)
     static const uint8_t           owner[] = "co_owner_fresh";
     uint64_t                       clientid;
 
-    nfs4_client_table_init(&table,1);
-    clientid = nfs4_client_register(&table,owner,(int) sizeof(owner) - 1,
+    nfs4_client_table_init(&table);
+    clientid = nfs4_client_register(&table,TEST_CLIENTID(),owner,(int) sizeof(owner) - 1,
                                     0x5555ULL,41,NULL,NULL);
 
     /* (1) a freshly established client owes its RECLAIM_COMPLETE */
@@ -1146,8 +1156,8 @@ test_reclaim_complete_not_granted_to_new_clients(void)
     nfs4_client_table_free(&table);
 
     /* (2) reconstruction must not stamp a client that is already present */
-    nfs4_client_table_init(&table,1);
-    clientid = nfs4_client_register(&table,owner,(int) sizeof(owner) - 1,
+    nfs4_client_table_init(&table);
+    clientid = nfs4_client_register(&table,TEST_CLIENTID(),owner,(int) sizeof(owner) - 1,
                                     0x5555ULL,41,NULL,NULL);
     /* Any sessionid this table does not know will do: production hydrates
      * only on a lookup miss, so the id must not already be live here. */
@@ -1203,10 +1213,10 @@ test_hydrated_client_leaves_owner_table(void)
     static const uint8_t           owner[] = "co_owner_hydrated_reboot";
     uint64_t                       hydrated_id;
 
-    nfs4_client_table_init(&table,1);
+    nfs4_client_table_init(&table);
 
     /* --- a returning client, hydrated from its persisted session --- */
-    hydrated_id = nfs4_make_clientid(1,7);
+    hydrated_id = TEST_T1(1,1,7);
     memset(sessionid,0x5A,NFS4_SESSIONID_SIZE);
 
     memset(&srec,0,sizeof(srec));
@@ -1232,7 +1242,7 @@ test_hydrated_client_leaves_owner_table(void)
     princ.flavor = srec.princ_flavor;
 
     nfs4_client_exchange_id(&table,owner,(int) sizeof(owner) - 1,0x2222ULL,
-                            &princ,false,1,&eid);
+                            &princ,false,1,TEST_CLIENTID(),&eid);
     CHECK(eid.status == NFS4_OK);
     CHECK(eid.clientid != hydrated_id);
     CHECK(!eid.confirmed);
@@ -1276,7 +1286,7 @@ make_persistent_session(
     struct nfs4_client *c;
     uint64_t            clientid;
 
-    clientid = nfs4_client_register(table,owner,owner_len,0x7777ULL,41,
+    clientid = nfs4_client_register(table,TEST_CLIENTID(),owner,owner_len,0x7777ULL,41,
                                     NULL,NULL);
 
     evpl_mutex_lock(&table->nfs4_ct_lock);
@@ -1340,7 +1350,7 @@ test_hydrate_refuses_fenced_client(void)
     uint32_t                       nids;
     static const uint8_t           owner[] = "co_owner_fenced";
 
-    nfs4_client_table_init(&table,1);
+    nfs4_client_table_init(&table);
     session = make_persistent_session(&table,owner,sizeof(owner) - 1,&srec);
     memcpy(sessionid,session->nfs4_session_id,NFS4_SESSIONID_SIZE);
     nfs4_session_put(session);
@@ -1385,13 +1395,13 @@ test_hydrate_refuses_held_owner(void)
     static const uint8_t           owner[] = "co_owner_held";
     uint64_t                       holder_id;
 
-    nfs4_client_table_init(&table,1);
-    holder_id = nfs4_client_register(&table,owner,(int) sizeof(owner) - 1,
+    nfs4_client_table_init(&table);
+    holder_id = nfs4_client_register(&table,TEST_CLIENTID(),owner,(int) sizeof(owner) - 1,
                                      0x8888ULL,41,NULL,NULL);
 
     memset(sessionid,0x3C,NFS4_SESSIONID_SIZE);
     memset(&srec,0,sizeof(srec));
-    srec.clientid              = nfs4_make_clientid(1,4242);
+    srec.clientid              = TEST_T1(1,1,4242);
     srec.verifier              = 0x7777ULL;
     srec.princ_flavor          = 1;
     srec.replay_max_slots      = 8;
@@ -1433,7 +1443,7 @@ test_retired_client_outlives_session(void)
     struct nfs_client             *uc;
     static const uint8_t           owner[] = "co_owner_retired";
 
-    nfs4_client_table_init(&table,1);
+    nfs4_client_table_init(&table);
     session = make_persistent_session(&table,owner,sizeof(owner) - 1,&srec);
 
     c = cancel_and_fence(&table,srec.clientid);
@@ -1475,13 +1485,13 @@ test_exchange_id_sequence_for_returning_client(void)
     static const uint8_t           sid[NFS4_SESSIONID_SIZE] = { 1 };
     struct nfs_client             *superseded               = NULL;
 
-    nfs4_client_table_init(&table,1);
+    nfs4_client_table_init(&table);
     memset(&princ,0,sizeof(princ));
     memset(&attrs,0,sizeof(attrs));
     princ.flavor = 1;
 
     nfs4_client_exchange_id(&table,owner,(int) sizeof(owner) - 1,0x3333ULL,
-                            &princ,false,1,&eid);
+                            &princ,false,1,TEST_CLIENTID(),&eid);
     CHECK(eid.status == NFS4_OK && !eid.confirmed);
     CHECK(eid.sequenceid == 1);
 
@@ -1493,7 +1503,7 @@ test_exchange_id_sequence_for_returning_client(void)
 
     /* Case 2: same owner, verifier and principal. */
     nfs4_client_exchange_id(&table,owner,(int) sizeof(owner) - 1,0x3333ULL,
-                            &princ,false,1,&eid);
+                            &princ,false,1,TEST_CLIENTID(),&eid);
     CHECK(eid.status == NFS4_OK && eid.confirmed);
     CHECK(eid.sequenceid == 2);
 
@@ -2464,21 +2474,14 @@ test_nfs_drc_copy_results(void)
 *  Multi-node namespacing (N instances over one shared backing store) *
 * ------------------------------------------------------------------ */
 
-/* clientid carries the minting node in its high 16 bits and a per-instance
- * counter in the low 48, and the stateid epoch carries the node in its high 16
- * bits -- so two instances over one store never hand out colliding values. */
+/* The stateid epoch carries the node in its high 16 bits, so two instances
+ * over one store never hand out colliding stateids.  (Client IDs no longer
+ * carry a node: they come from the client ID allocator and are opaque here;
+ * see test_clientid_allocator.) */
 static void
 test_node_scoped_identifiers(void)
 {
     struct nfs_state_table ta,tb;
-
-    /* clientid pack/unpack: node recoverable, counter preserved, no aliasing. */
-    CHECK((nfs4_make_clientid(7,42) >> 48) == 7);
-    CHECK((nfs4_make_clientid(7,42) & NFS4_CLIENTID_COUNTER_MASK) == 42);
-    /* Same counter on two different nodes -> two different clientids. */
-    CHECK(nfs4_make_clientid(7,42) != nfs4_make_clientid(8,42));
-    /* A node's whole 48-bit counter space stays within its own band. */
-    CHECK((nfs4_make_clientid(7,NFS4_CLIENTID_COUNTER_MASK) >> 48) == 7);
 
     /* stateid epoch: node in the high 16 bits, low bit set, and two nodes that
      * init in the same second still get distinct epochs. */
@@ -2494,73 +2497,187 @@ test_node_scoped_identifiers(void)
     printf("ok: node_scoped_identifiers\n");
 } /* test_node_scoped_identifiers */
 
-/* Issue #1377: node_id is the same on every boot of a node, so the clientids
- * and setclientid_confirm verifiers of one boot must still never be handed out
- * by a later one (RFC 7530 §9.1.1, §16.33.5) -- the pre-restart clientid has
- * to stay unknown, so the client it was minted for is told
- * NFS4ERR_STALE_CLIENTID and reclaims, instead of resolving to whichever new
- * client the number went to. */
+/* Issue #1377 and the allocator-driven registration path.  Client IDs come
+ * from the client ID allocator; the registry asks for one only when the RFC
+ * case needs it, keeps the owner reserved meanwhile, coalesces identical
+ * requests, answers others NFS4ERR_DELAY, classifies again with the new ID,
+ * rejects an ID already in use, and never reads the ID's bits. */
 static void
-test_clientid_boot_scoped(void)
+test_clientid_registration(void)
 {
     struct nfs4_client_table       t1,t2;
     struct nfs4_client_principal   princ;
-    struct nfs4_setclientid_result r1,r2;
+    struct nfs4_setclientid_result r1;
+    struct nfs4_reg_args           ra;
+    struct nfs4_reg_waiter         w1,w2,w3,waiters[1 + NFS4_REG_MAX_WAITERS];
+    struct nfs4_reg_outcome        out;
     struct nfs4_client            *c;
     struct nfs_client             *destroy_unified = NULL;
-    static const uint8_t           owner_a[]       = "boot_scoped_a";
-    static const uint8_t           owner_b[]       = "boot_scoped_b";
-    uint64_t                       restored,seq_before;
+    static const uint8_t           owner_a[]       = "reg_owner_a";
+    static const uint8_t           owner_b[]       = "reg_owner_b";
+    static const uint8_t           owner_r[]       = "reg_restored";
+    const uint64_t                 c1              = TEST_T1(9,7,100);
+    const uint64_t                 c2              = TEST_T1(9,7,101);
+    const uint64_t                 c3              = TEST_T1(9,7,102);
+    uint64_t                       token,token2;
+    int                            n;
 
     memset(&princ,0,sizeof(princ));
     princ.flavor = 1;
+    memset(&w1,0,sizeof(w1));
+    memset(&w2,0,sizeof(w2));
+    memset(&w3,0,sizeof(w3));
+    w1.req = (struct nfs_request*) 0x1;
+    w2.req = (struct nfs_request*) 0x2;
+    w3.req = (struct nfs_request*) 0x3;
 
-    /* Boot 1: client A registers. */
-    nfs4_client_table_init(&t1,7);
+    nfs4_client_table_init(&t1);
     nfs4_client_table_set_boot(&t1,1000000000ULL);
-    CHECK(t1.nfs4_ct_boot_gen != 0);
+
+    /* No candidate: a case that needs a fresh ID changes nothing. */
     nfs4_client_setclientid(&t1,owner_a,(int) sizeof(owner_a) - 1,0x1111ULL,
-                            &princ,0,&r1);
-    CHECK(r1.status == NFS4_OK);
-    CHECK(nfs4_clientid_node(r1.clientid) == 7);
-    CHECK(nfs4_clientid_boot(r1.clientid) == t1.nfs4_ct_boot_gen);
-
-    /* Boot 2 of the same node: the first client to register is someone else. */
-    nfs4_client_table_init(&t2,7);
-    nfs4_client_table_set_boot(&t2,2000000000ULL);
-    CHECK(t2.nfs4_ct_boot_gen != t1.nfs4_ct_boot_gen);
-    nfs4_client_setclientid(&t2,owner_b,(int) sizeof(owner_b) - 1,0x2222ULL,
-                            &princ,0,&r2);
-    CHECK(r2.status == NFS4_OK);
-    CHECK(nfs4_clientid_node(r2.clientid) == 7);
-    CHECK(r2.clientid != r1.clientid);
-    CHECK(memcmp(r2.confirm,r1.confirm,NFS4_VERIFIER_SIZE) != 0);
-
-    /* A's clientid means nothing to the new boot, and a confirm of A's old
-     * pair retransmitted across the restart cannot succeed. */
-    HASH_FIND(nfs4_client_hh_by_id,t2.nfs4_ct_clients_by_id,
-              &r1.clientid,sizeof(r1.clientid),c);
+                            &princ,0,0,&r1);
+    CHECK(r1.need_id && r1.status == NFS4ERR_DELAY);
+    HASH_FIND(nfs4_client_hh_by_owner,t1.nfs4_ct_clients_by_owner,
+              owner_a,sizeof(owner_a) - 1,c);
     CHECK(c == NULL);
+
+    /* With a candidate the record takes exactly that ID. */
+    nfs4_client_setclientid(&t1,owner_a,(int) sizeof(owner_a) - 1,0x1111ULL,
+                            &princ,0,c1,&r1);
+    CHECK(!r1.need_id && r1.status == NFS4_OK && r1.clientid == c1);
+
+    /* A later boot (fresh table) does not know the pre-restart ID, and a
+     * confirm of the old pair retransmitted across the restart fails. */
+    nfs4_client_table_init(&t2);
+    nfs4_client_table_set_boot(&t2,2000000000ULL);
     CHECK(nfs4_client_setclientid_confirm(&t2,r1.clientid,r1.confirm,&princ,
                                           &destroy_unified) ==
           NFS4ERR_STALE_CLIENTID);
     CHECK(destroy_unified == NULL);
 
-    /* boot_gen 0 is reserved for clientids minted before it existed. */
-    nfs4_client_table_set_boot(&t2,0);
-    CHECK(t2.nfs4_ct_boot_gen == 1);
-    nfs4_client_table_set_boot(&t2,2000000000ULL);
+    /* --- reservation, coalescing, DELAY ---------------------------------- */
+    memset(&ra,0,sizeof(ra));
+    ra.kind         = NFS4_REG_SETCLIENTID;
+    ra.owner        = owner_b;
+    ra.owner_len    = sizeof(owner_b) - 1;
+    ra.verifier     = 0x2222ULL;
+    ra.principal    = princ;
+    ra.cb_program   = 0x40000000;
+    ra.cb_ident     = 1;
+    ra.cb_netid     = "tcp";
+    ra.cb_netid_len = 3;
+    ra.cb_addr      = "127.0.0.1.3.5";
+    ra.cb_addr_len  = 13;
 
-    /* Restoring a persisted session whose clientid an earlier boot (or a
-     * pre-boot_gen build) minted leaves this boot's sequence alone: the
-     * two cannot collide. */
-    seq_before = t2.nfs4_ct_next_client_id;
-    restored   = nfs4_make_clientid(7,(seq_before & NFS4_CLIENTID_SEQ_MASK) + 5);
-    CHECK(nfs4_clientid_boot(restored) != t2.nfs4_ct_boot_gen);
+    CHECK(nfs4_client_reg_begin(&t2,&ra,&w1,&out,&token) == NFS4_REG_ALLOCATE);
+    /* An identical request (a retransmission) is coalesced. */
+    CHECK(nfs4_client_reg_begin(&t2,&ra,&w2,&out,&token2) == NFS4_REG_WAITING);
+    /* A different one (client rebooted: new verifier) is told to retry. */
+    ra.verifier = 0x3333ULL;
+    CHECK(nfs4_client_reg_begin(&t2,&ra,&w3,&out,&token2) == NFS4_REG_DONE);
+    CHECK(out.scid.status == NFS4ERR_DELAY);
+    ra.verifier = 0x2222ULL;
+    /* So is one with different callback arguments. */
+    ra.cb_ident = 2;
+    CHECK(nfs4_client_reg_begin(&t2,&ra,&w3,&out,&token2) == NFS4_REG_DONE);
+    CHECK(out.scid.status == NFS4ERR_DELAY);
+    ra.cb_ident = 1;
+
+    /* The allocator returns an ID already in use: discarded, try again. */
+    nfs4_client_register(&t2,c2,"holder",6,0x1ULL,41,NULL,NULL);
+    CHECK(nfs4_client_reg_commit(&t2,owner_b,sizeof(owner_b) - 1,token,0,c2,&out) ==
+          NFS4_REG_RETRY);
+    /* A wrong token is stale. */
+    CHECK(nfs4_client_reg_commit(&t2,owner_b,sizeof(owner_b) - 1,token + 99,0,c3,&out) ==
+          NFS4_REG_STALE);
+    /* Then a fresh one is committed after re-classification. */
+    CHECK(nfs4_client_reg_commit(&t2,owner_b,sizeof(owner_b) - 1,token,0,c3,&out) ==
+          NFS4_REG_COMMITTED);
+    CHECK(out.scid.status == NFS4_OK && out.scid.clientid == c3);
+    /* Finish returns the original first, then the coalesced duplicate. */
+    n = nfs4_client_reg_finish(&t2,owner_b,sizeof(owner_b) - 1,token,waiters,
+                               1 + NFS4_REG_MAX_WAITERS);
+    CHECK(n == 2 && waiters[0].req == w1.req && waiters[1].req == w2.req);
+    /* The reservation is gone, so the next request is classified normally. */
+    CHECK(nfs4_client_reg_finish(&t2,owner_b,sizeof(owner_b) - 1,token,waiters,
+                                 1 + NFS4_REG_MAX_WAITERS) == 0);
+
+    /* Allocator errors: transient -> DELAY, permanent -> SERVERFAULT. */
+    CHECK(nfs4_clientid_alloc_status_to_nfs(EAGAIN) == NFS4ERR_DELAY);
+    CHECK(nfs4_clientid_alloc_status_to_nfs(ENOMEM) == NFS4ERR_DELAY);
+    CHECK(nfs4_clientid_alloc_status_to_nfs(ESHUTDOWN) == NFS4ERR_DELAY);
+    CHECK(nfs4_clientid_alloc_status_to_nfs(ENOSPC) == NFS4ERR_SERVERFAULT);
+    CHECK(nfs4_clientid_alloc_status_to_nfs(EIO) == NFS4ERR_SERVERFAULT);
+    CHECK(nfs4_clientid_alloc_status_to_nfs(EINVAL) == NFS4ERR_SERVERFAULT);
+    ra.verifier = 0x4444ULL;   /* a reboot: Case needs a fresh ID */
+    CHECK(nfs4_client_reg_begin(&t2,&ra,&w1,&out,&token) == NFS4_REG_ALLOCATE);
+    CHECK(nfs4_client_reg_commit(&t2,owner_b,sizeof(owner_b) - 1,token,ENOSPC,0,&out) ==
+          NFS4_REG_COMMITTED);
+    CHECK(out.scid.status == NFS4ERR_SERVERFAULT);
+    CHECK(nfs4_client_reg_finish(&t2,owner_b,sizeof(owner_b) - 1,token,waiters,
+                                 1 + NFS4_REG_MAX_WAITERS) == 1);
+
+    /* Repeated collisions give up with SERVERFAULT. */
+    CHECK(nfs4_client_reg_begin(&t2,&ra,&w1,&out,&token) == NFS4_REG_ALLOCATE);
+    for (n = 1; n < NFS4_REG_MAX_COLLISIONS; n++) {
+        CHECK(nfs4_client_reg_commit(&t2,owner_b,sizeof(owner_b) - 1,token,0,c2,&out) ==
+              NFS4_REG_RETRY);
+    }
+    CHECK(nfs4_client_reg_commit(&t2,owner_b,sizeof(owner_b) - 1,token,0,c2,&out) ==
+          NFS4_REG_COMMITTED);
+    CHECK(out.scid.status == NFS4ERR_SERVERFAULT);
+    nfs4_client_reg_finish(&t2,owner_b,sizeof(owner_b) - 1,token,waiters,
+                           1 + NFS4_REG_MAX_WAITERS);
+
+    /* --- EXCHANGE_ID: Linux's two calls give C1 then C2 (Case 4) ---------- */
+    {
+        static const uint8_t owner_x[] = "reg_linux_mount";
+        const uint64_t       e1        = TEST_T1(9,7,200);
+        const uint64_t       e2        = TEST_T1(9,7,201);
+
+        memset(&ra,0,sizeof(ra));
+        ra.kind         = NFS4_REG_EXCHANGE_ID;
+        ra.owner        = owner_x;
+        ra.owner_len    = sizeof(owner_x) - 1;
+        ra.verifier     = 0x5555ULL;
+        ra.principal    = princ;
+        ra.minorversion = 1;
+
+        CHECK(nfs4_client_reg_begin(&t2,&ra,&w1,&out,&token) == NFS4_REG_ALLOCATE);
+        CHECK(nfs4_client_reg_commit(&t2,owner_x,sizeof(owner_x) - 1,token,0,e1,&out) ==
+              NFS4_REG_COMMITTED);
+        CHECK(out.eid.status == NFS4_OK && out.eid.clientid == e1);
+        CHECK(nfs4_client_reg_finish(&t2,owner_x,sizeof(owner_x) - 1,token,waiters,
+                                     1 + NFS4_REG_MAX_WAITERS) == 1);
+
+        /* Second, distinct call after the first reply: no reservation, Case 4. */
+        CHECK(nfs4_client_reg_begin(&t2,&ra,&w1,&out,&token) == NFS4_REG_ALLOCATE);
+        CHECK(nfs4_client_reg_commit(&t2,owner_x,sizeof(owner_x) - 1,token,0,e2,&out) ==
+              NFS4_REG_COMMITTED);
+        CHECK(out.eid.status == NFS4_OK && out.eid.clientid == e2);
+        nfs4_client_reg_finish(&t2,owner_x,sizeof(owner_x) - 1,token,waiters,
+                               1 + NFS4_REG_MAX_WAITERS);
+        if (out.eid.destroy_unified) {
+            nfs_client_destroy(out.eid.destroy_unified,NULL,NULL,false);
+        }
+        HASH_FIND(nfs4_client_hh_by_id,t2.nfs4_ct_clients_by_id,&e1,sizeof(e1),c);
+        CHECK(c == NULL);
+
+        /* Case 2: once confirmed, the same owner+verifier+principal gets the
+         * same ID back without asking the allocator. */
+        HASH_FIND(nfs4_client_hh_by_id,t2.nfs4_ct_clients_by_id,&e2,sizeof(e2),c);
+        CHECK(c != NULL);
+        c->nfs4_client_confirmed = 1;
+        CHECK(nfs4_client_reg_begin(&t2,&ra,&w1,&out,&token) == NFS4_REG_DONE);
+        CHECK(out.eid.status == NFS4_OK && out.eid.clientid == e2 && out.eid.confirmed);
+    }
+
+    /* --- hydration: verbatim IDs, owner check ----------------------------- */
     {
         struct nfs4_drc_session_record srec;
         uint8_t                        sessionid[NFS4_SESSIONID_SIZE];
-        static const uint8_t           owner_r[] = "boot_scoped_restored";
+        const uint64_t                 restored = 0x102a000000000005ULL; /* pre-allocator format */
 
         memset(&srec,0,sizeof(srec));
         memset(sessionid,0x6B,NFS4_SESSIONID_SIZE);
@@ -2571,22 +2688,28 @@ test_clientid_boot_scoped(void)
         srec.replay_maxresp_cached = 4096;
         srec.owner_len             = sizeof(owner_r) - 1;
         memcpy(srec.owner,owner_r,srec.owner_len);
-        nfs_client_put(nfs4_drc_reconstruct_session(&t2,sessionid,&srec,
-                                                    0x9999ULL,
+        nfs_client_put(nfs4_drc_reconstruct_session(&t2,sessionid,&srec,0x9999ULL,
                                                     NFS4_MAX_REPLY_CACHE_SLOTS));
+        HASH_FIND(nfs4_client_hh_by_id,t2.nfs4_ct_clients_by_id,
+                  &restored,sizeof(restored),c);
+        CHECK(c != NULL);
+
+        /* Another owner's persisted session naming an ID that is already in
+         * use here must not attach to it. */
+        memset(sessionid,0x6C,NFS4_SESSIONID_SIZE);
+        srec.clientid  = c3;   /* held by owner_b */
+        srec.owner_len = sizeof(owner_r) - 1;
+        CHECK(nfs4_drc_reconstruct_session(&t2,sessionid,&srec,0x9999ULL,
+                                           NFS4_MAX_REPLY_CACHE_SLOTS) == NULL);
     }
-    HASH_FIND(nfs4_client_hh_by_id,t2.nfs4_ct_clients_by_id,
-              &restored,sizeof(restored),c);
-    CHECK(c != NULL);
-    CHECK(t2.nfs4_ct_next_client_id == seq_before);
 
     nfs4_client_table_destroy_unified(&t1,NULL,NULL);
     nfs4_client_table_free(&t1);
     nfs4_client_table_destroy_unified(&t2,NULL,NULL);
     nfs4_client_table_free(&t2);
 
-    printf("ok: clientid_boot_scoped\n");
-} /* test_clientid_boot_scoped */
+    printf("ok: clientid_registration\n");
+} /* test_clientid_registration */
 
 /* Two complementary sharing properties:
  *
@@ -2703,7 +2826,7 @@ main(void)
     test_nfs_drc_copy_results();
 
     test_node_scoped_identifiers();
-    test_clientid_boot_scoped();
+    test_clientid_registration();
     test_two_node_key_isolation();
 
     printf("PASS: all nfs persistence tests\n");

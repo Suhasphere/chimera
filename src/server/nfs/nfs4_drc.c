@@ -9,6 +9,7 @@
 
 #include "prometheus-c.h"
 #include "nfs4_drc.h"
+#include "clientid_format.h"
 #include "nfs4_lease.h"
 #include "nfs4_session.h"
 #include "nfs4_state.h"
@@ -581,6 +582,21 @@ nfs4_drc_ensure_client(
     HASH_FIND(nfs4_client_hh_by_id, table->nfs4_ct_clients_by_id,
               &client_id, sizeof(client_id), client);
     if (client) {
+        /* Opacity-preserving collision check: the ID is already in use here.
+         * Attach only if it is the same client; a different owner under the
+         * same ID must never inherit this record (the session's client then
+         * sees NFS4ERR_BADSESSION and re-establishes). */
+        if (client->nfs4_client_owner_len != owner_len ||
+            memcmp(client->nfs4_client_owner, owner, owner_len) != 0) {
+            char idbuf[160];
+
+            clientid_format(client_id, idbuf, sizeof(idbuf));
+            chimera_nfs_error("NFS4 hydrate: client ID %s is held by a different "
+                              "owner; refusing to attach the persisted session",
+                              idbuf);
+            evpl_mutex_unlock(&table->nfs4_ct_lock);
+            return NULL;
+        }
         if (client->unified && !client->nfs4_client_fenced_ns &&
             !nfs_client_lease_cancelled(client->unified)) {
             unified = nfs_client_get(client->unified);
@@ -662,19 +678,13 @@ nfs4_drc_ensure_client(
     HASH_ADD(nfs4_client_hh_by_id, table->nfs4_ct_clients_by_id,
              nfs4_client_id, sizeof(client->nfs4_client_id), client);
 
-    /* A restored clientid keeps the node_id and boot_gen it was minted under
-     * (nfs4_mint_clientid), so it cannot collide with one this boot mints --
-     * unless it names this node and a boot whose generation folded to the
-     * same 16 bits as this one's.  Only then keep the sequence ahead of it. */
-    if (nfs4_clientid_node(client_id) == table->nfs4_ct_node_id &&
-        nfs4_clientid_boot(client_id) == table->nfs4_ct_boot_gen) {
-        uint64_t seq = client_id & NFS4_CLIENTID_SEQ_MASK;
-
-        if ((table->nfs4_ct_next_client_id & NFS4_CLIENTID_SEQ_MASK) <= seq) {
-            table->nfs4_ct_next_client_id = seq + 1;
-        }
-    }
-
+    /* The restored client ID is stored and used verbatim; nothing here reads
+     * its bits, and nothing here advances the allocator: a decoded Sequence
+     * would describe the namespace that minted the ID (another node, instance
+     * or generation), not this run's.  This run's namespace cannot contain it
+     * (a fresh supervisor Generation; pre-allocator IDs decode as Generation
+     * 0, which Type 1 never issues), and a commit-time collision check guards
+     * new registrations regardless. */
     unified = nfs_client_get(client->unified);
 
     evpl_mutex_unlock(&table->nfs4_ct_lock);

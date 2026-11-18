@@ -350,6 +350,9 @@ struct nfs4_replay_metrics {
 /* uthash-tracked in-flight 4.1 session hydrate (defined in nfs4_drc.c). */
 struct nfs4_drc_hydra;
 
+struct clientid_allocator;
+struct json_t;
+
 struct chimera_server_nfs_shared {
 
     const struct chimera_server_config *config;
@@ -464,6 +467,13 @@ struct chimera_server_nfs_shared {
     uint32_t                            nfs4_max_slots;
 
     struct nfs4_client_table            nfs4_shared_clients;
+    /* NFSv4 client ID allocator (clientid_allocator.h): the resolved
+     * configuration from nfs_server_init, the allocator itself from
+     * nfs_server_start.  nfs4_offered is 0 when the configuration was
+     * rejected, in which case the NFSv4 program is never registered. */
+    struct clientid_allocator          *clientid_alloc;
+    struct json_t                      *clientid_config;
+    int                                 nfs4_offered;
     struct nfs_state_table              nfs4_state_table;
     struct nfs_layout_table             nfs4_layout_table;   /* fh -> layout holders */
     struct nfs_pnfs_devcache            nfs4_pnfs_devcache;  /* sourced deviceid -> descriptor */

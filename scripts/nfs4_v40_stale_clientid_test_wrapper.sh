@@ -18,6 +18,8 @@
 
 set -u
 
+source "$(dirname "${BASH_SOURCE[0]}")/chimera_clientid_test_env.sh"
+
 # Save and clear LD_PRELOAD immediately to avoid ASAN interference with system
 # binaries (ip, sysctl, ...) which exit non-zero under ASAN.  Restored only for
 # the chimera daemon.
@@ -114,6 +116,7 @@ ulimit -l unlimited
 # start_chimera <boot number>: start the daemon and wait for its NFS port.
 start_chimera() {
     CHIMERA_LOG="${SESSION_DIR}/chimera.boot$1.log"
+    chimera_clientid_test_env   # a fresh supervisor grant per start
     if [ -n "${SAVED_LD_PRELOAD}" ]; then
         ip netns exec "${NETNS_NAME}" env LD_PRELOAD="${SAVED_LD_PRELOAD}" \
             "$CHIMERA_BINARY" -c "$CONFIG_FILE" > "$CHIMERA_LOG" 2>&1 &
