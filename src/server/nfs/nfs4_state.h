@@ -543,6 +543,11 @@ struct nfs_layout_state {
     uint8_t                  shard;
     uint32_t                 slot_idx;
     uint32_t                 generation;
+    /* stateid.other epoch, fixed at creation from the state table's epoch --
+    * the same one OPEN, LOCK and delegation stateids carry, so generic
+    * stateid validation (TEST_STATEID, FREE_STATEID) recognises the layout.
+    * It is never derived from the client ID, which is an opaque identity. */
+    uint32_t                 stateid_epoch;
 
     /* Membership in the server-wide layout table (keyed by fh): the table this
      * layout is registered in, and the next holder of the same file. */
@@ -1291,7 +1296,6 @@ nfs_layout_state_create(
     uint16_t                 fh_len,
     uint16_t                 export_id,
     uint32_t                 iomode,
-    uint32_t                 client_short_id,
     struct nfs_state_table  *table,
     struct nfs_layout_table *layout_table,
     struct stateid4         *out_stateid);
@@ -1301,7 +1305,6 @@ nfs_layout_state_create(
 SYMBOL_EXPORT void
 nfs_layout_state_bump(
     struct nfs_layout_state *state,
-    uint32_t                 client_short_id,
     struct stateid4         *out_stateid);
 
 /* Tear down a layout_state (LAYOUTRETURN / client teardown). */
